@@ -22,15 +22,15 @@ flowchart LR
         API["lib/api.ts<br/>typed fetch wrapper"]
     end
     subgraph server["Node — api/ :4000"]
-        MW["middleware<br/>cors · json · auth · limits"]
+        MW["middleware<br/>cors · json · multer · auth · limits"]
         RT["routes<br/>validate + status codes"]
         SV["services<br/>business logic"]
-        LB["lib<br/>chunk · embed · retrieve · answer"]
+        LB["lib<br/>pdf · chunk · embed · retrieve · answer"]
     end
     DB[("Neon Postgres<br/>+ pgvector")]
     OAI["OpenAI"]
 
-    UI --> Ctx --> API -->|"JSON / NDJSON + Bearer JWT"| MW --> RT --> SV --> LB
+    UI --> Ctx --> API -->|"JSON / multipart / NDJSON + Bearer JWT"| MW --> RT --> SV --> LB
     SV --> DB
     LB --> DB
     LB --> OAI
@@ -300,9 +300,16 @@ impossible** — every current *and future* route in that router is covered.
 
 ## Flow 4 — Ingest a document (the write path)
 
-**User action:** pastes text at `/documents`, clicks *Ingest document*.
+**User action:** at `/documents`, either pastes text and clicks *Ingest document*, or picks a PDF
+and clicks *Upload PDF*.
 
 This is the flow with the most moving parts. Take it slowly.
+
+Two entry points converge almost immediately. The PDF route does its own work up front — parse the
+multipart body, verify the bytes, extract text page by page — and then calls **the same
+`ingestDocument`** the paste route does, with one extra argument. Everything after that point is
+byte-for-byte identical, which is the whole design: the pipeline never learns that PDFs exist, so
+the next format is a new parser rather than a new branch through chunking, embedding and persistence.
 
 ```mermaid
 sequenceDiagram
@@ -332,7 +339,7 @@ sequenceDiagram
         S->>DB: document.create — status PENDING
         S->>DB: update status = PROCESSING
         S->>CH: chunkText(content) — 1000 / 200
-        CH-->>S: [{ content, chunkIndex }, …]
+        CH-->>S: [{ content, chunkIndex }, …]<br/>(+ page, for PDFs)
         S->>EM: embed(chunk texts)
         loop batches of 100
             EM->>AI: embeddings.create
@@ -362,6 +369,37 @@ sequenceDiagram
 route in this router that costs anything (it embeds up to ~200 chunks). The two GETs are reads of
 rows the user already paid for. Sharing one bucket would mean a dashboard **polling** a `PROCESSING`
 document could exhaust the budget for **uploading** one — a self-inflicted outage.
+
+**1b. The PDF route's five steps before it rejoins the paste path.** Order is deliberate: each step
+is cheaper than the one after it, so the common failures cost the least.
+
+| # | Step | Rejects with | Why here |
+|---|---|---|---|
+| 1 | `ingestLimiter` → `multer.single("file")` | `429` / `413` / `400` | The limiter runs **before** multer, so a rate-limited caller is turned away without us first accepting and buffering 10 MB from them |
+| 2 | `req.file` present? | `400` | Multer does not treat a missing file as an error — without this check it's a `TypeError` surfacing as a `500` |
+| 3 | Leading bytes are `%PDF-`? | `400` | See below — this is the only real check on file type |
+| 4 | `extractPdf` → per-page text; `hasNoText`? | `400` corrupt / password-protected · **`422`** scanned | `422` because the request and the file were both fine; there is simply nothing to index |
+| 5 | `pages.join("\n\n").trim()` → over 200k? | `400` | Extracted text never passes through a body schema, so the paste path's ceiling is enforced again by hand |
+
+**1c. `Content-Type` is a claim; magic bytes are evidence.** `req.file.mimetype` is not an
+inspection of the file — multer copies it from the header the *client* wrote into that part of the
+multipart body. `curl -F "file=@evil.html;type=application/pdf"` asserts whatever it likes, and
+multer reports it with total confidence. The `%PDF-` check reads the actual first five bytes.
+Verified: the forged-content-type case returns `400 "That file isn't a PDF."`
+
+Be precise about what this is, because an interviewer will push: it is **necessary, not
+sufficient** — it proves the file *starts* like a PDF, not that it is valid or benign. The real
+guarantee is that pdf.js either parses it or throws, plus the fact that the bytes are never stored
+and never served back, which is what rules out the classic "upload HTML, get it served, browser
+sniffs it, stored XSS" path. In *this* app it is defence-in-depth and a better error message, not
+an exploit being stopped. Claiming more than that is how you lose the room.
+
+**1d. `express.json({ limit: "1mb" })` does not apply here, and knowing why is the point.** Body
+parsers are **content-type-gated**: `express.json()` checks the `Content-Type` header first, sees
+`multipart/form-data; boundary=…`, and calls `next()` having read zero bytes. Its limit is never
+consulted. Multer's `limits.fileSize` is the *only* bound on an upload — get it wrong and there is
+no bound at all. (Frontend analogy: event delegation. One listener fires for every click, but the
+handler opens with `if (!e.target.matches('.btn')) return`.)
 
 **2. `userId` comes from the token, spread order matters:**
 
@@ -467,6 +505,13 @@ rides along so the UI can say *"already in your library"* instead of a misleadin
 | Empty / whitespace content | `400` from zod (`.trim()` before `.min(1)`) | ✅ |
 | Content > 200,000 chars | `400` with a field message | ✅ Deliberately below the 1 mb JSON limit, so it fails here with a readable message rather than as a bare 413 |
 | Duplicate content | `200` + `deduped: true` | ✅ Idempotent |
+| Upload: not a PDF, or forged `Content-Type` | `400` from the magic-byte check | ✅ Verified with an HTML file renamed `.pdf`, sent both honestly and with `;type=application/pdf` |
+| Upload: file > 10 MB | `413` | ✅ Needed its own `MulterError` branch in the error middleware — it was a `500` before that |
+| Upload: no file / wrong field name | `400` | ✅ |
+| Upload: corrupt or password-protected | `400`, each with its own message | ✅ pdf.js `PasswordException` matched by `name`, not by message text, which is prose and version-dependent |
+| Upload: scanned / image-only PDF | `422` naming the cause | ✅ The most likely real-world failure. A generic error here makes the app look broken rather than the file unsupported |
+| Upload: extracted text > 200,000 chars | `400` — **rejected, not truncated** | ✅ Silently keeping the first 200k produces a document the user believes is complete, then a confident "that isn't in your documents" for anything past the cut. A failed upload is recoverable; a silently incomplete corpus is not |
+| Two PDFs, same text, different images | `200` + `deduped: true`, UI names the existing document | ✅ Correct, and the message has to work harder here than on the paste path — dedupe is on **text**, so the filename the user just picked never appears in the list |
 | Concurrent duplicate | P2002 caught, winner returned | ✅ |
 | Chunking yields 0 chunks | `READY`, `chunkCount: 0` | ✅ A valid outcome, not an error |
 | OpenAI 429 mid-embed | `FAILED` + reason, `500` to client | 🔴 **See below** |
@@ -860,7 +905,9 @@ flowchart TD
     Z -->|yes| Z1["400 { error: 'ValidationError', details }"]
     Z -->|no| H{"HttpError?"}
     H -->|yes| H1["err.status { error: err.message }"]
-    H -->|no| B{"body-parser error<br/>with 4xx status?"}
+    H -->|no| M{"MulterError?"}
+    M -->|yes| M1["413 too large · 400 malformed multipart"]
+    M -->|no| B{"body-parser error<br/>with 4xx status?"}
     B -->|yes| B1["that status + a readable message"]
     B -->|no| U["console.error(...) → 500 'Internal Server Error'"]
 ```
@@ -877,6 +924,15 @@ nothing about how to fix it.
 
 **Why only 4xx from body-parser is trusted:** a 5xx coming out of it is a real server fault, not a bad
 request, so it belongs in the logged branch.
+
+**Why `MulterError` needed a branch of its own — the same bug, a second time.** Multer's error
+carries a `code` (`"LIMIT_FILE_SIZE"`) but **not** the `type` + numeric `status` pair that the
+body-parser predicate sniffs for. So it matched nothing above it and fell straight through to the
+generic 500: uploading a 12 MB PDF returned *"Internal Server Error"* for something entirely the
+client's side and entirely fixable. The lesson generalises past this one library — **a middleware
+that can reject a request before your route runs will have its own error type**, and a catch-all
+that only understands the errors your own code throws will mislabel every one of them as a server
+fault. Worth checking whenever a new body-consuming middleware is added.
 
 **Why the fallthrough logs but doesn't leak:** `console.error` server-side, generic message to the
 client. An unhandled error's message can contain a connection string, a file path, or a SQL fragment.

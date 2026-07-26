@@ -590,6 +590,81 @@ worst possible failure schedule, because it passes every quick manual test.
 
 ---
 
+### 1.14 File uploads — multipart, and the limit that doesn't apply
+
+A JSON body is one string. A file upload isn't: `multipart/form-data` splits the body into **parts**,
+each with its own headers, separated by a random token called a **boundary**:
+
+```
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryX7dK9
+
+------WebKitFormBoundaryX7dK9
+Content-Disposition: form-data; name="title"
+
+Q3 handbook
+------WebKitFormBoundaryX7dK9
+Content-Disposition: form-data; name="file"; filename="q3.pdf"
+Content-Type: application/pdf
+
+%PDF-1.7 …binary…
+------WebKitFormBoundaryX7dK9--
+```
+
+Three things follow from that layout, and each one is a bug people hit exactly once:
+
+**1. Body parsers are content-type-gated.** `express.json()` is not a general body reader — it
+checks `Content-Type` first, and if it isn't `application/json` it calls `next()` having read zero
+bytes. So `express.json({ limit: "1mb" })` **never engages on an upload**, and multer's
+`limits.fileSize` is the only ceiling that exists. Assume otherwise and you have shipped an
+unbounded upload while believing you configured a limit.
+
+> **Frontend analogy:** event delegation. One listener on the container fires for every click, but
+> the handler opens with `if (!e.target.matches('.btn')) return`. Express stacks `express.json()`,
+> `express.urlencoded()` and multer precisely because each self-selects on content type and ignores
+> everything else.
+
+**2. Never set `Content-Type` yourself when sending `FormData`.** The browser generates it
+*including* the boundary token, and that token is what tells the server where each part begins.
+Hard-code the header and the boundary is missing; the server is told "this is multipart" and handed
+a body it cannot split. The failure looks like a backend bug, which is where you'll waste the
+afternoon.
+
+```ts
+// ✅ browser fills in Content-Type: multipart/form-data; boundary=…
+fetch(url, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: form });
+```
+
+**3. Every string in that body is attacker-controlled — including the ones that look like
+metadata.** `Content-Type: application/pdf` on the file part is a claim *the client wrote*. So is
+`filename`. Multer surfaces the first as `file.mimetype` and the second as `file.originalname`, and
+neither has been verified by anything. `curl -F "file=@evil.html;type=application/pdf"` sets them
+to whatever it likes.
+
+The check that means something is the **magic bytes** — the actual leading bytes of the content. A
+PDF starts with `%PDF-`. That is evidence; the header is testimony.
+
+```ts
+const PDF_MAGIC = Buffer.from("%PDF-");
+buffer.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC);
+```
+
+Be precise about how much that buys, because overclaiming it is worse than not doing it: magic bytes
+are **necessary, not sufficient**. They prove the file *starts* like a PDF, not that it is valid or
+safe. The real guarantee is that the parser either succeeds or throws — plus, here, that the bytes
+are never stored and never served back, which is what forecloses the classic upload-HTML →
+served-back → browser-sniffs-it → stored-XSS chain.
+
+**Memory vs. disk storage.** `multer.memoryStorage()` keeps the file in a `Buffer`; `diskStorage`
+writes it to a temp path you must then clean up on *every* path, including the failures. Memory is
+right here because the file exists only long enough to become text, and it is only safe because
+`limits.fileSize` bounds how much memory that can be. Reverse that reasoning — memory storage with
+no size cap — and you have a one-request out-of-memory kill.
+
+📁 [`api/src/lib/pdf.ts`](../api/src/lib/pdf.ts) ·
+[`api/src/modules/documents/document.routes.ts`](../api/src/modules/documents/document.routes.ts)
+
+---
+
 ## Part 2 — The AI half
 
 ### 2.1 What RAG is, and what it is not
@@ -695,7 +770,37 @@ a thought has a muddled meaning.
 // api/src/lib/chunk.ts
 export async function chunkText(text, { chunkSize = 1000, chunkOverlap = 200 } = {}) { … }
 // returns [{ content, chunkIndex }, …]  — chunkIndex maps 1:1 to Chunk.chunkIndex, making it cite-able
+
+export async function chunkPages(pages: string[], opts?) { … }
+// the PDF path: splits each page independently
+// returns [{ content, chunkIndex, page }, …]  — chunkIndex still runs across the whole document
 ```
+
+**Structure-aware chunking, and the trade it forces.** A PDF arrives as an array of pages, so each
+page is split *independently* and every chunk carries its page number. That is the entire reason
+PDF upload is worth building: a citation becomes *"page 7"* — something a reader can open the file
+and check — instead of *"chunk 12"*, an internal ordinal they have no way to look up. A citation
+nobody can verify is just a claim with a number next to it.
+
+It is not free, and the cost is the interesting part:
+
+- **The page boundary becomes a *hard* chunk boundary.** Overlap only applies within one splitter
+  call, so a paragraph spanning a page break is split with nothing bridging it. Accepted
+  deliberately: a chunk covering two pages has no single honest page to cite, and a *wrong*
+  citation is worse than a split paragraph.
+- **`chunkSize` gains a second maximum that appears in no config file — the length of a page.** A
+  300-page PDF with one short paragraph per page yields ~300 tiny chunks instead of ~45 well-sized
+  ones. Follow that through: small chunks embed into vague vectors that match on surface keywords
+  rather than meaning; `k = 5` then feeds the model ~750 characters of context instead of ~5,000;
+  the model hedges or refuses; and it looks like a *prompt* problem when it is a *chunking*
+  problem. That misdiagnosis is the expensive part.
+
+The fix is a merge pass over consecutive short pages — which immediately breaks the data model,
+because the merged chunk spans pages 4–9 and `Chunk.page` holds one integer. So it is a schema
+change, not a tweak. Left unbuilt on purpose: whether it matters depends entirely on the corpus
+(dense pages make the problem vanish), and that is a question hit-rate@k can answer and judgement
+cannot. **"I shipped the simple version and let a measurement decide" is a stronger answer than
+having guessed correctly.**
 
 **Own the honest caveat:** 1000/200 were chosen by judgement, not measurement. Smaller chunks =
 precise matches but fragmentary context; larger = richer context but diluted vectors and a more
@@ -890,7 +995,9 @@ answer. "It works great" is not.
 | JWT | HS256, 1 hour expiry | [`jwt.ts`](../api/src/lib/jwt.ts) |
 | Password hash | argon2id (library defaults) | [`password.ts`](../api/src/modules/auth/password.ts) |
 | Title / content / question max | 200 / 200,000 / 1,000 chars | `*.schema.ts` |
-| JSON body limit | 1 mb | [`app.ts`](../api/src/app.ts) |
+| JSON body limit | 1 mb — **does not apply to uploads** | [`app.ts`](../api/src/app.ts) |
+| Upload file limit | 10 mb, 1 file (the only bound on a multipart body) | [`document.routes.ts`](../api/src/modules/documents/document.routes.ts) |
+| Uploaded PDF page limit | 200 pages | [`pdf.ts`](../api/src/lib/pdf.ts) |
 | Rate limits | signup 15/hr·IP · login 10/15min·IP (failures only) · ingest 10/hr·user · queries 10/min + 50/day·user · 2000/day global | [`rate-limit.ts`](../api/src/middleware/rate-limit.ts) |
 | Concurrent streams | 2 per user | [`app.ts`](../api/src/app.ts#L121) |
 | Ingest transaction timeout | 30s (`maxWait` 5s) | [`document.service.ts`](../api/src/modules/documents/document.service.ts#L179) |

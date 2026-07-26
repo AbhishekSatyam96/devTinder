@@ -13,10 +13,10 @@ padded claim that collapses under one follow-up question does more damage than t
 
 ### 30 seconds
 
-> It's a document Q&A app. You paste in your own documents, ask questions in natural language, and
-> get an answer that's generated **only** from your text — streamed token by token, with inline
-> citations you can click to see the exact passage it came from. If your documents don't contain the
-> answer, it refuses rather than guessing.
+> It's a document Q&A app. You paste text or upload a PDF, ask questions in natural language, and
+> get an answer that's generated **only** from your documents — streamed token by token, with inline
+> citations you can click to see the exact passage it came from, down to the page. If your documents
+> don't contain the answer, it refuses rather than guessing.
 >
 > The interesting part isn't the AI call, it's everything around it: chunking and embedding on the
 > write path, vector search with tenant isolation on the read path, and a streaming endpoint that
@@ -55,7 +55,9 @@ If they hand you a marker, draw this and talk through it.
 
 ```
                  WRITE PATH (nobody is waiting → should be queued)
-  paste text → validate → sha256 dedupe → chunk (1000/200) → embed (batches of 100)
+  paste text ─┐
+  upload PDF ─┴→ validate → sha256 dedupe → chunk (1000/200, per page for PDFs)
+             → embed (batches of 100)
              → ONE transaction: insert chunks, set vectors, mark READY
 
                  READ PATH (a human IS waiting → stream it)
@@ -227,6 +229,105 @@ tell a regression from noise.
 </details>
 
 ### 3.2 Backend and API design
+
+<details>
+<summary><b>⭐ You added PDF upload. Why is that more than "accept a file"?</b></summary>
+
+Because the file format was never the point — the **page structure** was.
+
+`Chunk.page` had been in the schema since the first migration and sat `NULL` for as long as pasted
+text was the only input, because a string has no pages. A PDF is the only source that can fill it.
+So the feature is *page-aware chunking*: each page is split independently and every chunk carries
+its page number, which moves a citation from "chunk 12" — an internal ordinal the reader cannot look
+up — to "page 7", which they can open the file and check.
+
+That distinction matters for the product's core claim. The whole system is built on the idea that a
+grounded answer beats a confident one, and grounding is only worth anything if the user can *verify*
+it. A citation nobody can check is a claim with a number next to it.
+
+And I can state the cost, which is the part that makes it a real decision rather than a feature:
+chunking per page makes the page a **hard** chunk boundary. Overlap can't bridge a paragraph that
+spans a page break, and `chunkSize` picks up a second maximum that isn't in any config — the length
+of a page. A 300-page PDF of short pages gives ~300 tiny chunks instead of ~45 good ones, and small
+chunks embed into vague vectors. I shipped it anyway and wrote the limitation into the code, because
+whether it bites depends entirely on the corpus, and the eval harness can answer that where I'd only
+be guessing.
+</details>
+
+<details>
+<summary><b>⭐ Why a separate `/documents/upload` route rather than one route handling both?</b></summary>
+
+Two body parsers, two validation schemas, two error taxonomies. Branching on `Content-Type` inside
+one handler couples three sets of failure modes that have nothing to do with each other, and the
+JSON route — which was working — would have had to be reopened to add it.
+
+They converge one line later: the upload route parses the PDF, then calls **the same
+`ingestDocument`** with one extra argument. Both answer the identical `{ document, deduped }` body,
+so the client keeps one type, one renderer and one polling loop.
+
+The general principle: **share the domain logic, not the transport handler.** The pipeline never
+learns that PDFs exist, so the next format is a new parser rather than a new branch through
+chunking, embedding and persistence.
+</details>
+
+<details>
+<summary><b>⭐ How do you validate that an uploaded file is actually a PDF?</b></summary>
+
+Magic bytes — the actual leading bytes of the content. A PDF starts with `%PDF-`.
+
+Specifically **not** `file.mimetype`, which is what most people reach for. That value isn't an
+inspection of anything: multer copies it from the `Content-Type` header the *client* wrote into that
+part of the multipart body. `curl -F "file=@evil.html;type=application/pdf"` claims whatever it
+likes and multer reports it with complete confidence. The filename is client-controlled too — it can
+legally contain `../` and NUL bytes, so I sanitise it before it becomes a document title.
+
+Then the honest limit, because this is where people overclaim: magic bytes are **necessary, not
+sufficient**. They prove the file *starts* like a PDF, not that it's valid or benign. The real
+guarantee is that pdf.js either parses it or throws — plus the fact that I never store the bytes and
+never serve them back, which is what forecloses the classic upload-HTML → served-back →
+browser-sniffs-it → stored-XSS chain. In this app the byte check is defence-in-depth and a much
+better error message. It isn't stopping a live exploit, and I wouldn't claim it is.
+</details>
+
+<details>
+<summary><b>⭐ Your JSON body limit is 1 MB. How does a 10 MB upload get through?</b></summary>
+
+It never touches that limit. **Body parsers are content-type-gated.** `express.json()` checks
+`Content-Type` first, sees `multipart/form-data`, and calls `next()` having read zero bytes — its
+limit is never consulted. Multer's `limits.fileSize` is the *only* bound on an upload.
+
+That's worth knowing precisely because getting it wrong is silent: you'd have configured a limit,
+believed uploads were capped, and shipped an unbounded one.
+
+It also caused a real bug I had to fix. Multer rejects an oversized file by throwing a
+`MulterError`, which carries a `code` but not the `type`/`status` pair my error middleware's
+body-parser branch checks for. So it matched nothing and fell through to the generic 500 — a 12 MB
+upload returned "Internal Server Error" for something entirely the client's side and entirely
+fixable. It needed its own branch mapping `LIMIT_FILE_SIZE` to 413. The generalisable lesson: any
+middleware that can reject a request before your route runs will have its own error type, and a
+catch-all that only knows your errors will mislabel every one of them as a server fault.
+</details>
+
+<details>
+<summary><b>⭐ Two different PDF files produce the same dedupe hash. Bug?</b></summary>
+
+No — that's the design working, and the reasoning is the interesting part.
+
+I hash the **extracted text**, not the file bytes. Two PDFs whose text is identical produce identical
+chunks and identical embeddings; storing both means the retriever holds two copies of everything and
+`k=5` fills with duplicates, crowding out other documents. So the dedupe isn't only saving money,
+it's protecting retrieval quality.
+
+Hashing the bytes instead would be *worse*, which is the non-obvious bit. Re-export the same document
+tomorrow and the bytes differ — embedded timestamps, a different producer string, different
+compression — so a user re-uploading what is plainly the same document pays the full embedding cost
+again. Byte-hashing dedupes *less* than you want, precisely because PDFs are full of non-semantic
+noise.
+
+The wrinkle I did have to handle is UX. Upload `handbook-v2.pdf` where only the diagrams changed and
+it dedupes against v1 — so a bare "already ingested" leaves the user staring at a list that doesn't
+contain the filename they just picked. The message names the existing document instead.
+</details>
 
 <details>
 <summary><b>Why a separate Express API instead of Next.js API routes?</b></summary>
@@ -671,7 +772,10 @@ judgement.
 | **Login timing side-channel** | Messages match, timings don't. Fix is a dummy-hash verify. |
 | **Token in `localStorage`** | XSS-stealable. `httpOnly` cookie is the hardening step, and it needs CSRF protection with it. |
 | **In-memory rate-limit store** | Per-process, so it multiplies by instance count behind an autoscaler. One-line swap to Redis. |
-| **No hybrid search** | Embeddings underperform on exact identifiers — error codes, SKUs, names. BM25 + vector with fusion is the standard answer. |
+| **No hybrid search** | Embeddings underperform on exact identifiers — error codes, SKUs, names. BM25 + vector with fusion is the standard answer. I've seen this concretely: a test corpus of near-identical paragraphs distinguished only by a marker token retrieved at a flat ~0.52 similarity across all of them and correctly refused, because there was no *semantic* difference to find. |
+| **Per-page chunking makes the page a hard chunk boundary** | Overlap can't bridge a page break, and a PDF of short pages produces many small, weakly-retrievable chunks. The fix is a merge pass, which needs a page *range* on the chunk table — a schema change. Deliberately gated on the eval harness: whether it matters depends on the corpus, and that's measurable. |
+| **Uploaded files aren't stored** | Only the extracted text is kept. It means re-processing can't recover text a better parser would have found — the user would have to upload again. Fine while extraction is a solved problem for text-bearing PDFs; not fine if OCR were in scope. |
+| **No OCR** | Scanned PDFs are detected (every page extracts empty) and rejected with a specific 422 rather than silently ingested as an empty document. Supporting them is a different capability, not a bigger version of this one. |
 | **No re-ranking** | Top-k by cosine distance only. A cross-encoder re-ranker over ~20 candidates is the usual next quality win. |
 | **Answer rendered as plain text** | It's markdown; rendering it properly means sanitising, since the text originates from a model reading user-supplied documents. Deliberate stopping point. |
 | **No observability** | No structured logs, no tracing, no cost metering per query. Dollar metering needs `stream_options: { include_usage: true }` and somewhere to put it. |
@@ -711,6 +815,10 @@ Pick 3–4. Each is defensible from the code.
 >   than IP.
 > - Modelled ingestion as a `PENDING → PROCESSING → READY | FAILED` state machine with SHA-256
 >   content dedupe made race-safe by a database unique constraint and P2002 recovery.
+> - Added multipart PDF ingestion with page-aware chunking, so citations resolve to a source page
+>   rather than an internal chunk ordinal; file type is validated by magic bytes rather than the
+>   client-supplied content type, and dedupe hashes extracted text so re-exports of the same
+>   document don't re-embed.
 > - Authored HLD and LLD design docs covering topology, failure modes, capacity, and a scaling
 >   ladder.
 
@@ -724,6 +832,7 @@ Pick 3–4. Each is defensible from the code.
 
 **Backend:** Node.js · Express 5 · REST API design · layered architecture · middleware · JWT auth ·
 argon2 password hashing · runtime validation (zod) · error handling · rate limiting · streaming HTTP
+· multipart file upload · content-type validation by magic bytes · PDF text extraction (pdf.js)
 
 **Database:** PostgreSQL · Prisma ORM · schema design · migrations · indexing (composite, unique,
 HNSW) · transactions · connection pooling · raw SQL · multi-tenant data isolation
@@ -774,13 +883,19 @@ Cover the answers. If you hesitate, reread the linked section.
 12. Why does `POST /documents` re-read the row before responding?
 13. Trace the abort chain from tab-close to OpenAI.
 14. Why does the documents page poll the list rather than each document?
+15. Why doesn't `express.json({ limit: "1mb" })` bound a 10 MB upload? → [§1.14](concepts.md#114-file-uploads--multipart-and-the-limit-that-doesnt-apply)
+16. Why is `file.mimetype` worthless as a security control, and what replaces it?
+17. Why must you *not* set `Content-Type` when sending a `FormData` body?
+18. Dedupe hashes extracted text, not file bytes. Give the argument for that, then the cost.
+19. What does per-page chunking do to a 300-page PDF of one-paragraph pages? → [§2.3](concepts.md#23-chunking--why-documents-get-cut-up)
 
 **Judgement**
-15. What's the first thing you'd fix, and why that one?
-16. What can't you currently measure?
-17. What would break first at 100× scale?
-18. Which decision in this project are you least sure about? *(Good honest answer: chunk size, and
-    the eval harness exists to settle it.)*
+20. What's the first thing you'd fix, and why that one?
+21. What can't you currently measure?
+22. What would break first at 100× scale?
+23. Which decision in this project are you least sure about? *(Good honest answer: chunk size — and
+    now per-page vs. whole-document chunking, which is the same kind of question. The eval harness
+    exists to settle both.)*
 
 ---
 
