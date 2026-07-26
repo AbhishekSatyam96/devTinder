@@ -4,7 +4,8 @@ const app = express();
 const User = require("./models/user");
 const bcrypt = require("bcrypt");
 const cookieParser = require("cookie-parser");
-const jwt = require('jsonwebtoken');
+const jwt = require("jsonwebtoken");
+const { userAuth } = require("./middlewares/auth");
 
 app.use(express.json());
 app.use(cookieParser());
@@ -45,17 +46,13 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.get("/profile", async (req, res) => {
-  const cookies = req.cookies;
-  const token = cookies.token;
+app.get("/profile", userAuth, async (req, res) => {
   try {
-    const decoded = jwt.verify(token, "secretKey");
-    const user = await User.findById(decoded.userId);
-    res.send(user);
+    res.send(req.user);
   } catch (err) {
     res.status(400).send("Invalid token");
   }
-})
+});
 
 app.get("/feed", async (req, res) => {
   try {
