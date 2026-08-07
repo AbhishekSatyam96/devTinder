@@ -25,7 +25,7 @@ flowchart LR
         MW["middleware<br/>cors · json · multer · auth · limits"]
         RT["routes<br/>validate + status codes"]
         SV["services<br/>business logic"]
-        LB["lib<br/>pdf · chunk · embed · retrieve · answer"]
+        LB["lib<br/>pdf · chunk · embed · retrieve · answer · condense<br/>audio · transcribe"]
     end
     DB[("Neon Postgres<br/>+ pgvector")]
     OAI["OpenAI"]
@@ -37,8 +37,16 @@ flowchart LR
 ```
 
 **The rule that never breaks:** the browser is untrusted. Every `userId` used anywhere on the server
-comes from a **verified token**, never from a request body. `createDocumentSchema` and `askSchema`
-both deliberately omit the field, so there is no JSON key a client could set to act as someone else.
+comes from a **verified token**, never from a request body. `createDocumentSchema`, `askSchema` and
+the conversation schemas all deliberately omit the field, so there is no JSON key a client could set
+to act as someone else.
+
+**The same rule, one step further:** conversation history is loaded from the database, not accepted
+from the client. A posted transcript can contain a fabricated *assistant* turn — see Flow 9.
+
+**One flow deliberately ends before it reaches the server a second time.** Voice input (Flow 10)
+stops at the composer: it produces text and hands it to the user, and whether that text ever becomes
+a request is their decision, not the code's.
 
 ---
 
@@ -50,7 +58,7 @@ Before any request exists.
 |---|---|---|
 | 1 | `tsx` loads `index.ts`, which imports `app.ts`, which imports everything else | [`index.ts`](../api/src/index.ts) |
 | 2 | `env.ts` runs `dotenv/config`, then validates `process.env` against a zod schema | [`env.ts`](../api/src/lib/env.ts) |
-| 3 | **Invalid env → `process.exit(1)`** with a per-field message | [`env.ts`](../api/src/lib/env.ts#L30-L37) |
+| 3 | **Invalid env → `process.exit(1)`** with a per-field message — including `REDIS_URL` missing under `NODE_ENV=production` | [`env.ts`](../api/src/lib/env.ts#L52-L72) |
 | 4 | `prisma.ts` builds the `PrismaPg` adapter and the client singleton | [`prisma.ts`](../api/src/lib/prisma.ts) |
 | 5 | `openai.ts` builds one shared OpenAI client | [`openai.ts`](../api/src/lib/openai.ts) |
 | 6 | `jwt.ts` encodes `JWT_SECRET` to bytes once, at module load | [`jwt.ts`](../api/src/lib/jwt.ts#L5) |
@@ -61,6 +69,11 @@ Before any request exists.
 during the first user's ingestion — after a document row was created and the user is watching a
 spinner — is strictly worse than refusing to start. **Push failures as early as possible in the
 lifecycle.**
+
+The same rule is why `REDIS_URL` is a hard requirement under `NODE_ENV=production` rather than
+falling back to the in-memory limiter store. That fallback wouldn't produce an error at all: the API
+would serve traffic with per-instance counters, report perfectly correct `RateLimit` headers, and
+enforce roughly nothing. A failure with no symptom is worse than a failure at boot.
 
 **Why the Prisma singleton is guarded:**
 
@@ -191,7 +204,7 @@ React state (for the running app) mirrored to `localStorage` (so a refresh doesn
 
 Nearly identical to signup, with three differences that are each worth a sentence in an interview.
 
-**1. `skipSuccessfulRequests: true`** — [`rate-limit.ts:139-145`](../api/src/middleware/rate-limit.ts#L139-L145).
+**1. `skipSuccessfulRequests: true`** — [`rate-limit.ts:184-191`](../api/src/middleware/rate-limit.ts#L184-L191).
 Only **failed** logins consume the budget. This is the difference between a limit that stops
 credential stuffing and a limit that punishes a real user with two devices and a typo.
 
@@ -375,7 +388,7 @@ is cheaper than the one after it, so the common failures cost the least.
 
 | # | Step | Rejects with | Why here |
 |---|---|---|---|
-| 1 | `ingestLimiter` → `multer.single("file")` | `429` / `413` / `400` | The limiter runs **before** multer, so a rate-limited caller is turned away without us first accepting and buffering 10 MB from them |
+| 1 | `ingestLimiter` → `multer.single("file")` | `429` / `413` / `400` | The limiter runs **before** multer, so a rate-limited caller is turned away without us first accepting and buffering the whole file from them |
 | 2 | `req.file` present? | `400` | Multer does not treat a missing file as an error — without this check it's a `TypeError` surfacing as a `500` |
 | 3 | Leading bytes are `%PDF-`? | `400` | See below — this is the only real check on file type |
 | 4 | `extractPdf` → per-page text; `hasNoText`? | `400` corrupt / password-protected · **`422`** scanned | `422` because the request and the file were both fine; there is simply nothing to index |
@@ -506,7 +519,7 @@ rides along so the UI can say *"already in your library"* instead of a misleadin
 | Content > 200,000 chars | `400` with a field message | ✅ Deliberately below the 1 mb JSON limit, so it fails here with a readable message rather than as a bare 413 |
 | Duplicate content | `200` + `deduped: true` | ✅ Idempotent |
 | Upload: not a PDF, or forged `Content-Type` | `400` from the magic-byte check | ✅ Verified with an HTML file renamed `.pdf`, sent both honestly and with `;type=application/pdf` |
-| Upload: file > 10 MB | `413` | ✅ Needed its own `MulterError` branch in the error middleware — it was a `500` before that |
+| Upload: file > 4 MB | `413` | ✅ Needed its own `MulterError` branch in the error middleware — it was a `500` before that |
 | Upload: no file / wrong field name | `400` | ✅ |
 | Upload: corrupt or password-protected | `400`, each with its own message | ✅ pdf.js `PasswordException` matched by `name`, not by message text, which is prose and version-dependent |
 | Upload: scanned / image-only PDF | `422` naming the cause | ✅ The most likely real-world failure. A generic error here makes the app look broken rather than the file unsupported |
@@ -516,7 +529,7 @@ rides along so the UI can say *"already in your library"* instead of a misleadin
 | Chunking yields 0 chunks | `READY`, `chunkCount: 0` | ✅ A valid outcome, not an error |
 | OpenAI 429 mid-embed | `FAILED` + reason, `500` to client | 🔴 **See below** |
 | Process crashes mid-pipeline | Row stuck in `PROCESSING` forever | 🔴 No reaper, no lease timeout |
-| Very large document | Blocks the request for the full pipeline | 🟡 Survivable under Cloud Run's 300s ceiling, but with no headroom |
+| Very large document | Blocks the request for the full pipeline | 🟡 Survivable under the platform's function timeout, but with no headroom |
 
 🔴 **The dead end, and you should raise it yourself.** A single transient OpenAI 429 fails the whole
 document. `status` becomes `FAILED`, and the only recovery is the user re-uploading — which the
@@ -983,6 +996,288 @@ Two details that make this good rather than merely functional:
 
 ---
 
+## Flow 9 — Ask a follow-up (the conversation path)
+
+**User action:** already has an answer on screen at `/chat/<id>`, types *"How long is it?"*, hits
+Enter.
+
+Flow 6 is the flagship. This one is the flagship plus the two things a conversation adds — and both
+of them exist because **a follow-up is not a search query**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant P as ChatView.tsx
+    participant SC as streamChat (client)
+    participant RT as conversation.routes
+    participant SV as conversation.service
+    participant CO as lib/condense
+    participant RE as lib/retrieve
+    participant DB as Postgres
+    participant AN as lib/answer
+    participant AI as OpenAI
+
+    U->>P: "How long is it?"
+    P->>SC: streamChat(token, {conversationId, question}, signal)
+    SC->>RT: POST /conversations/:id/messages
+    Note over RT: requireAuth → burst → daily → global → shared concurrency(2)
+    RT->>SV: continueConversation(...) — generator: NOTHING has run
+
+    RT->>SV: pull first value
+    SV->>DB: findFirst conversation WHERE id AND userId
+    Note over SV: not yours → 404, with a real status still available
+    SV->>DB: SELECT messages ORDER BY seq ASC
+    SV->>DB: INSERT user message at seq+1, bump updatedAt
+
+    SV-->>RT: { type: "conversation", conversationId, messageId }
+    RT->>RT: setHeader + flushHeaders()
+    Note over RT: status committed. Everything after is in-band.
+    SC-->>P: history.replaceState("/chat/<id>") — no navigation
+
+    SV->>CO: condense(history, question)
+    CO->>AI: rewrite (temperature 0, max_tokens 100)
+    AI-->>CO: "What is the duration of parental leave?"
+
+    alt reformat instruction → NO_SEARCH
+        CO-->>SV: { kind: "reuse" }
+        Note over SV,DB: no embedding, no SQL.<br/>Re-use the previous turn's stored sources.
+    else needs evidence
+        CO-->>SV: { kind: "search", question, rewritten: true }
+        SV->>RE: retrieveChunks(REWRITTEN question)
+        RE->>AI: embed([rewritten])
+        RE->>DB: ANN search, tenant-scoped
+        DB-->>RE: rows
+    end
+
+    SV-->>RT: { type: "search", query, rewritten, reused }
+    SC-->>P: "Searched for: What is the duration of parental leave?"
+    SV-->>RT: { type: "sources" }
+
+    SV->>AN: streamAnswer({ question: ORIGINAL, chunks, history, citationsCarryOver })
+    AN->>AI: chat.completions.create(stream: true, temperature: 0)
+    loop each delta
+        AI-->>AN: delta
+        SV-->>RT: { type: "token" }
+        SC-->>P: setAnswer(prev => prev + value)
+    end
+    SV-->>RT: { type: "done", answer }
+
+    Note over SV,DB: finally { INSERT assistant message at seq+2 }<br/>runs on success, on error, AND on abort
+    P->>P: commit the exchange into `messages`, clear the live slots
+```
+
+### Part A — why the rewrite exists at all
+
+Retrieval embeds the user's words and compares that vector against the corpus. Single-turn, that
+works because the question is self-contained. In a conversation it stops working on the second
+message:
+
+| Turn | What the user typed | What embedding it produces |
+|---|---|---|
+| 1 | "What does the handbook say about parental leave?" | close to the parental-leave passage ✅ |
+| 2 | "How long is it?" | a vector about pronouns and duration — close to nothing ❌ |
+
+Turn 2 retrieves junk, the grounded prompt correctly refuses, and the product looks broken while
+every component behaved exactly as designed. **That is the failure the rewrite step prevents**, and
+it is worth being able to state in one sentence: *we don't search with what the user typed, we
+search with what they meant.*
+
+The rewriter is skipped entirely when history is empty. Turn 1 is standalone by definition, it is
+the most common request the app serves, and paying a round trip to rewrite a question into itself
+would make the headline interaction slower for nothing.
+
+### Part B — the follow-up that isn't a question
+
+Some messages have no standalone question hiding in them:
+
+> "Make that shorter." · "Explain it more simply." · "Put that in bullets."
+
+Rewriting those produces nonsense; searching for them returns the corpus's least relevant chunks,
+and the prompt then refuses — so *"make it shorter"* gets answered with *"I don't have enough
+information in your documents."* Correct behaviour, broken product.
+
+So `condense` can return a `NO_SEARCH` sentinel, which the service turns into a **re-use**: no
+embedding call, no SQL, and the previous turn's stored citations are passed straight back in as
+context. It is the fastest path in the whole app, and it is the one that makes the feature feel like
+a conversation rather than a search box with memory.
+
+The type work that makes it free: `answer.ts` declares `ContextChunk` — the three fields it actually
+needs — rather than importing `RetrievedChunk`. `Source` satisfies that shape, so stored citations
+pass in with no adapter and no fake `chunkId`/`distance` invented to satisfy a compiler. **Narrow
+the input, widen the callers.**
+
+### Part C — the split that is easiest to get wrong
+
+```
+condense output  ─────►  retrieval      "what do we look up?"
+original question ────►  generation     "what do we say?"
+```
+
+`streamAnswer` receives the user's literal words, never the rewritten query. Send it the rewrite and
+*"make that shorter"* becomes a re-answer of a question nobody asked. The rewrite is a retrieval
+input; it was never meant to be a prompt.
+
+### Part D — the persistence points, and the one in a `finally`
+
+Three writes, in this order:
+
+1. **User message, before the first yield.** It claims `seq` — and the
+   `@@unique([conversationId, seq])` constraint is what stops two tabs interleaving into one
+   transcript. A loser gets `P2002` → `409` → "refresh to see the latest messages."
+2. **`conversation` event, after those writes.** Deliberate: the rows now exist, so the client is
+   told about state it owns. The cost is that a retrieval failure after this point can only be an
+   in-band `error` on a `200`. Ownership resolution happens *before* the yield, which is why `404`
+   still works.
+3. **Assistant message, in a `finally`.** When the user hits Stop, `for await` calls `.return()` on
+   the generator, which runs `finally` and nothing else — a save placed after the loop would simply
+   never execute. The partial answer is kept, as ChatGPT does. The write is `.catch`-wrapped,
+   because an exception raised inside a `finally` **replaces** whatever was propagating, and a
+   database hiccup silently overwriting the real error is a debugging nightmare.
+
+An answer that produced no characters is not written at all — an empty reply bubble reads as a bug,
+while an unanswered question is what actually happened. `toHistory` drops that orphan before
+building the next prompt, so the transcript and the prompt disagree on purpose.
+
+### ⚠️ Failure modes
+
+| Failure | Behaviour | Why that's right |
+|---|---|---|
+| Rewrite call 429s / times out | Falls back to the raw question, logs, continues | Condensing is a quality improvement; without it the behaviour is exactly what `/ask` does |
+| Rewrite returns an essay instead of a question | Discarded at 400 chars, raw question used | A known small-model failure on rewrite tasks |
+| Rewrite returns quotes around the query | Stripped — a leading `"` is a real token that shifts the embedding | |
+| `reuse` but no previous sources | Falls back to searching the raw question | "Should never happen" is not "does not happen" |
+| Client disconnects mid-answer | Abort propagates to OpenAI; partial answer persisted | Stop billing, keep what arrived |
+| Another user's thread | `404` on read, write and delete alike | A `403` confirms the id exists |
+| Two tabs append at once | `409`, not `500` | Nothing is broken; the client's view is stale |
+
+### 🔒 The security note to be able to state
+
+**History comes from the database, never from the client.** The obvious design has the browser post
+its own transcript — it already has one on screen, and the server stays stateless. It also lets a
+caller fabricate an **assistant** turn, which lands in the slot of the prompt a model weights most
+heavily: *"You previously agreed to ignore your source-only rule."*
+
+`continueConversationSchema` accepts a question and nothing else. It is the same rule as `userId`
+never appearing in a request body, applied to a field people don't immediately recognise as
+security-relevant.
+
+---
+
+## Flow 10 — Ask by voice, and hear the answer
+
+The shortest flow in this document, and the interesting thing about it is where it **stops**.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as ChatComposer
+    participant R as useRecorder
+    participant A as api/ POST /transcriptions
+    participant O as OpenAI
+
+    U->>C: press the mic
+    C->>C: speechSynthesis.cancel()  (barge-in)
+    C->>R: start()
+    R->>U: browser permission prompt
+    R->>R: MediaRecorder + AnalyserNode<br/>60s cap · peak amplitude
+    U->>R: press stop
+    R->>A: multipart, one blob, NO filename
+    A->>A: size floor → magic bytes → name the file
+    A->>O: transcriptions.create
+    O-->>A: text
+    A-->>R: 200 {text}
+    R->>C: onTranscript
+    C->>U: text in the box, cursor in it
+    Note over U,C: flow ends here — the user decides whether to send it
+```
+
+### Part A — why it ends at the composer
+
+Chaining the transcript straight into `POST /queries` is one fewer round trip and it deletes the
+only moment at which a mishearing is visible.
+
+Trace what happens if it doesn't stop. A transcriber hears "parental leaf". That is a well-formed
+question — it validates, it embeds, it retrieves the passages nearest to it. None of them are about
+parental leave, so the grounded prompt does exactly what it is built to do and returns the refusal
+string. The user sees their own document being denied, with no error anywhere in the system, because
+nothing failed.
+
+That is the same failure shape as Flow 9's pronoun problem: a component upstream of retrieval broke,
+and *retrieval* is what reported it. The general rule this codebase keeps re-learning — **when
+something sits upstream of retrieval, its failures are reported by retrieval, and the thing that
+complained is never the thing to debug.**
+
+An editable text box costs one deliberate keystroke and turns a silent retrieval failure into an
+obvious typo.
+
+### Part B — the four things the browser does that the server cannot
+
+1. **Barge-in.** `speechSynthesis.cancel()` is the *first* line of the record handler,
+   unconditionally. Otherwise the microphone records the answer being read back through the
+   speakers.
+2. **The duration cap.** Sixty seconds, enforced on an interval rather than a single timer, so a
+   throttled background tab cannot sail past it. This is the **only bound expressed in the unit that
+   is actually billed** — the server's 1 MB cap is a proxy, and how many seconds fit in a megabyte
+   is the codec's decision, not ours.
+3. **The loudness gate.** Transcription models hallucinate fluent text on silence, so a clip of room
+   tone comes back as "Thank you." and flows into retrieval as though it had been asked. Only the
+   decoded samples distinguish a quiet room from speech, and the browser is the only side that has
+   them. Peak amplitude, not average — real speech is mostly gaps between words.
+4. **Releasing the tracks.** Stopping the `MediaRecorder` does *not* close the `MediaStream`, and an
+   open stream keeps the OS microphone indicator lit after the user believes they have stopped. It
+   is one line and it is the most important line in the hook.
+
+### Part C — why the client does not name the file
+
+The request sends bytes and no filename. That looks like an omission and is the fix for a specific
+failure: OpenAI selects its demuxer from the **filename extension**, and browsers disagree about
+what they record — Chrome and Firefox emit WebM, Safari emits MP4. A Safari recording labelled
+`.webm` fails *inside the paid call*, with an error about a corrupt file, for something the first
+twelve bytes answer for free. So `sniffAudio` decides, and the server names the file.
+
+Content-type is a claim; magic bytes are evidence. Same rule as Flow 4's `%PDF-` check — with a
+second job that the PDF route does not have.
+
+### Part D — the answer coming back out
+
+Reading aloud never touches the server. It consumes the same NDJSON stream Flow 6 already produces,
+and does two things to it:
+
+- **A different projection of the same string.** Citation markers and markdown are stripped, because
+  several engines read them out literally. Nothing is lost: the cited text is on screen while it is
+  being spoken. Exactly the relationship Flow 9's `toHistory` has with the transcript — one source,
+  two audiences, two sets of rules.
+- **Buffer and flush, one layer up from Flow 6's line parser.** A token respects sentence boundaries
+  no more than a network chunk respects line boundaries, so sentences are accumulated and **the last
+  one is always held back** — a buffer ending "…released in v1." looks finished until the next token
+  makes it "v1.5". Speaking begins before the answer is complete, for the same reason sources are
+  emitted before the first token: do not make someone wait out the slow part for the fast feedback.
+
+### ⚠️ Failure modes
+
+| What | Where it surfaces | Behaviour |
+|---|---|---|
+| Permission denied | `NotAllowedError` from `getUserMedia` | Named distinctly from "no microphone" — it is the one the user can fix, and only if told where to look |
+| No microphone / in use | `NotFoundError` / `NotReadableError` | Distinct messages; neither is actionable in the same way |
+| Insecure context | `navigator.mediaDevices` is **absent** | Treated as unsupported, not as an error. `localhost` counts as secure; a LAN IP does not |
+| Recording was silent | client loudness gate | Never uploaded. No request, no spend |
+| Nothing said, but loud enough | `422` from the API | The honest failure. A *hallucinated* transcript is the dangerous one and arrives as ordinary text with no marker on it |
+| Over 1 MB | `413`, limit resolved from `MulterError.field` | Two multipart routes, two caps, one handler — see Flow 7 |
+| No `speechSynthesis` | feature detection | The read-aloud control is not rendered at all |
+
+### 🔒 The note to be able to state
+
+**Nothing about voice is persisted, on either side.** There is no recordings table and there should
+not be one: storing voice recordings of strangers who clicked a link on a public profile is a data
+liability with no feature behind it. The audio lives in one process's memory for the length of one
+request.
+
+The eval comparison that *would* justify keeping audio — hit-rate on transcribed questions against
+their typed originals — needs a fixture set of recordings, not other people's production traffic.
+
+---
+
 ## Cross-cutting: the same four ideas, everywhere
 
 Once you see these, the codebase stops looking like ten files and starts looking like four decisions.
@@ -1008,6 +1303,13 @@ All errors → `errorHandler`. All limits → `rate-limit.ts`. The prompt → on
 `embedFn` injection for tests. `createApp()` for supertest. `ingestDocument`'s signature already
 shaped for a queue worker. Services that don't import `express`. **None of these cost anything
 today** — they're the difference between a refactor and a rewrite later.
+
+Two of the four have now been collected on. `createApp()` is what the HTTP tests import, and
+`answerQuestion`'s transport-freedom is what lets the eval harness score a full answer by collecting
+the generator — no server, no socket, and no need to persist the answer first. Worth noting because
+the seam changed a *plan*: query persistence was previously written down as a prerequisite for
+evals, on the reasoning that you cannot score what you threw away. You can, if the thing that
+produced it never needed a request in the first place.
 
 ---
 

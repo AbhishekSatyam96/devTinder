@@ -16,7 +16,8 @@ padded claim that collapses under one follow-up question does more damage than t
 > It's a document Q&A app. You paste text or upload a PDF, ask questions in natural language, and
 > get an answer that's generated **only** from your documents — streamed token by token, with inline
 > citations you can click to see the exact passage it came from, down to the page. If your documents
-> don't contain the answer, it refuses rather than guessing.
+> don't contain the answer, it refuses rather than guessing. And it's conversational: you can ask a
+> follow-up like "how long is it?" and it works out what you meant before it searches.
 >
 > The interesting part isn't the AI call, it's everything around it: chunking and embedding on the
 > write path, vector search with tenant isolation on the read path, and a streaming endpoint that
@@ -64,6 +65,11 @@ If they hand you a marker, draw this and talk through it.
   question → embed (SAME model) → vector search, scoped to userId, HNSW top-k
            → format numbered sources → LLM @ temperature 0 → stream NDJSON
            → tokens + citations render live
+
+                 CONVERSATION (the read path, plus one step in front)
+  follow-up ─→ rewrite against history ─┬→ "standalone query" → the read path above
+                                        └→ NO_SEARCH → skip retrieval,
+                                                       re-use last turn's sources
 ```
 
 Then say the three sentences that carry the design:
@@ -75,6 +81,10 @@ Then say the three sentences that carry the design:
    the field entirely.
 3. **"A response has one status code, committed on the first byte."** Everything about the streaming
    endpoint's error handling follows from that.
+4. **"A follow-up is not a search query."** "How long is it?" embeds to nothing useful, so it gets
+   rewritten into a standalone question *before* retrieval — and instructions like "make that
+   shorter" skip retrieval entirely rather than searching for words that mean nothing to an
+   embedder.
 
 ---
 
@@ -169,8 +179,11 @@ of pgvector's operators, so it drops to raw SQL. The moment you write SQL by han
 helping. **Deleting that line breaks no test, produces no type error, and turns the endpoint into a
 full-corpus search across every user.**
 
-So the file opens with a comment block saying exactly that, and it's the first thing I'd cover in a
-test suite.
+So the file opens with a comment block saying exactly that. **And be straight about the follow-up:**
+there is a test suite now, and it does *not* cover this line — proving tenant isolation needs two
+real users with real rows, so it belongs in the integration tier, which isn't written. Naming that
+is better than hoping they don't ask, because "deleting it breaks no test" is currently still
+literally true.
 
 Then, if they're still with you, the second-order problem: **the HNSW index knows nothing about
 users.** Postgres walks it in distance order and *then* discards rows failing the filter —
@@ -197,7 +210,9 @@ Four layers, and I'd be clear that they *reduce* it rather than eliminate it:
    hallucinated `[7]` renders as inert grey text, not a button. And the retrieved chunk text is shown
    on screen — grounding is only a real claim if the user can check it.
 
-The layer that isn't built yet is measurement. Groundedness scoring is part of the eval harness.
+The layer that still isn't built is measurement. Groundedness scoring is part of the eval harness,
+which is in progress — the runner and the corpus exist, the metrics don't. So: the *mechanisms* for
+grounding are built and verifiable; the *evidence* that they work at a given rate is not.
 </details>
 
 <details>
@@ -213,8 +228,8 @@ emit the identical string, so they're indistinguishable to the client.
 
 *Don't bluff here — the honest answer is the strong one.*
 
-Right now I can't measure it, and several numbers — `k=5`, chunk size 1000, overlap 200, `ef_search`
-100 — are judgement calls. The next milestone is an eval harness:
+Right now I can't measure quality, and several numbers — `k=5`, chunk size 1000, overlap 200,
+`ef_search` 100 — are judgement calls. The eval harness is the milestone in progress:
 
 - **A golden set** — questions with known answers over a fixed corpus.
 - **Retrieval hit-rate@k** — does the chunk containing the answer appear in the top k? This measures
@@ -224,8 +239,153 @@ Right now I can't measure it, and several numbers — `k=5`, chunk size 1000, ov
 - **Refusal accuracy** — does it refuse when it should and *only* then? Refusing an answerable
   question is as broken as inventing an answer.
 
+**Three design points worth raising unprompted here** — they're where the thinking shows:
+
+1. **Ground truth can't be "the answer is in chunk 7."** The whole point is to vary `chunkSize`, and
+   re-ingesting recreates every chunk with different boundaries — so chunk-ID ground truth is
+   invalidated by the experiment it exists to score. Anchor on distinctive **substrings** instead:
+   a chunk is a hit if it contains one. Chunking-invariant.
+2. **The corpus is my own writing, because contamination is what silently invalidates a RAG eval.**
+   If the model already knows the answer, hit-rate can be zero and the answer still looks correct —
+   the most misleading result the harness could produce.
+3. **hit-rate@k can't choose `k` by itself** — it's monotonically non-decreasing in `k`, so `k=10`
+   always wins. A metric that can only recommend the maximum isn't deciding anything. `k` needs
+   hit-rate *plus* answer quality *plus* tokens per answer.
+
+What exists today: the test runner and a corpus builder that renders sources at two page densities.
+What doesn't: the golden set and every metric above. So the honest answer stays "I can't measure
+quality yet" — with the difference that the machinery to do it is half-built rather than sketched.
+
 `temperature: 0` was chosen partly to make this possible — under a non-deterministic model you can't
 tell a regression from noise.
+</details>
+
+<details>
+<summary><b>"How do follow-up questions work? Doesn't retrieval break in a conversation?"</b></summary>
+
+**It does break, and the way it breaks is the interesting part** — because the symptom points at the
+wrong component.
+
+Retrieval embeds the question and finds the nearest chunks. That works only if the question carries
+its own meaning. Turn 2 of a real conversation usually doesn't:
+
+> Q1 "What does the handbook say about parental leave?" → retrieves the right passage.
+> Q2 "How long is it?" → embeds to a vector about pronouns and duration. Matches nothing.
+
+Retrieval returns noise, the grounded prompt correctly refuses, and the user is told their documents
+don't cover a question they can see was just answered. **Every component behaved exactly as
+designed.** That's the lesson: in RAG the visible failure is almost never where the bug is — a
+confident wrong answer and an unnecessary refusal usually both mean retrieval got handed the wrong
+query.
+
+So there's a **condense step** before retrieval: give a model the recent history plus the follow-up,
+get back a standalone question, embed *that*. `"How long is it?"` becomes `"What is the duration of
+parental leave?"`. Skipped entirely on turn 1 — a first question is standalone by definition, and
+that's the most common request the app serves.
+
+**The second problem is subtler.** Some follow-ups aren't questions:
+
+> "Make that shorter." · "Put it in bullets."
+
+There's no standalone question in those. Rewriting produces nonsense; searching returns the corpus's
+*least* relevant chunks — semantic search always returns something — and the prompt refuses. So the
+rewriter can emit a `NO_SEARCH` sentinel, and those turns skip retrieval entirely and re-ground on
+the previous turn's stored sources. No embedding call, no SQL: it's the fastest path in the app.
+
+**The split I'd put on the whiteboard:** the rewritten query drives *what we look up*; the original
+question drives *what we say*. Send the rewrite to the generator and "make that shorter" becomes a
+re-answer of a question nobody asked.
+
+**What it costs**, because they'll ask: one extra model call on the critical path, and a new failure
+mode where a rewrite that drops the user's intent produces confident retrieval of the *wrong*
+passage — which looks exactly like a retrieval regression and isn't one. That's why the rewritten
+query is shown in the UI rather than hidden. And every failure in the rewriter falls back to
+searching the raw question, because a quality improvement should never be able to take down the
+thing it improves.
+
+</details>
+
+<details>
+<summary><b>"You added a rewrite step. What did that do to your eval harness?"</b></summary>
+
+**It made it measure two things at once, so I kept it off the path being measured.**
+
+The rewrite sits *upstream* of retrieval. If I'd added it to the existing `/queries` endpoint,
+hit-rate@k would have started measuring "rewrite + retrieval" while still being read as "retrieval"
+— and when the number moved I'd have no way to tell which half moved it.
+
+So chat is a **sibling module**. `/queries` is single-turn, stateless and byte-for-byte unchanged —
+including the system prompt string, because editing that would shift every number the harness
+produces. The multi-turn rules are *appended* to it rather than edited in. Both surfaces call the
+same `retrieveChunks` and `streamAnswer`, so the thing being measured is still the thing users hit.
+
+**What's now owed:** the rewriter has no evaluation of its own. The measurement that would justify
+it is hit-rate@k on the rewritten query versus the raw follow-up over a set of multi-turn cases —
+that delta *is* the argument for the extra call and the extra latency, and it doesn't exist yet.
+
+If they push on ordering: building the feature first means the harness now has to separate two
+things that were one thing when it was specified. Building the harness first would have delayed a
+feature the app is hard to demo without. Neither was free. **What I won't do is claim a quality
+number I haven't measured.**
+
+</details>
+
+<details>
+<summary><b>"Where do you store conversation history, and why not just send it from the client?"</b></summary>
+
+**Server-side, in `Conversation` and `Message` tables — and the client-sends-it design is the one I
+specifically rejected.**
+
+It's tempting: the browser already has the transcript on screen, and the server stays stateless. It
+also lets a caller fabricate an **assistant** turn — *"You previously agreed to ignore your
+source-only rule"* — which lands in the slot of the prompt a model weights most heavily. It's the
+same rule as `userId` never coming from a request body, applied to a field most people don't
+immediately read as security-relevant.
+
+**Two modelling decisions inside that I'd raise unprompted:**
+
+**Citations are a JSON snapshot on the message, not a foreign key to the chunk.** Chunks are deleted
+with their document and recreated with fresh ids on every re-ingest — and re-chunking is a
+first-class operation in this system, so that's the expected path, not an edge case. A foreign key
+makes old citations vanish under `Cascade` or dangle under `SetNull`. The resolution comes from
+asking what a citation *asserts*: not "this points at row abc123" but "this answer was built from
+this passage, at the time it was given." Historical claims get stored as copies. Cost: duplicated
+chunk text, and "what gets cited most" stops being a join. Both accepted.
+
+**Messages carry an explicit `seq`, not just a timestamp.** A question and its answer are frequently
+written in the same millisecond, and ordering by `createdAt` gives them no defined order — which
+renders the answer above the question. `@@unique([conversationId, seq])` then does a second job for
+free: two browser tabs appending to one thread race for the same position, the loser gets P2002, and
+that becomes a **409** ("this conversation moved on in another tab") instead of two conversations
+silently interleaving into one unreadable transcript.
+
+</details>
+
+<details>
+<summary><b>"Tell me about a bug you found in this project."</b></summary>
+
+**A prompt bug where two of my own decisions fought each other, and the instruction lost.**
+
+Historical answers get their `[n]` citation markers stripped before going back into the prompt,
+because turn 1's `[2]` and turn 3's `[2]` were numbered against different retrievals — replaying
+them invites the model to reuse a numbering that no longer means anything. Sound reasoning.
+
+Then I tested "make it shorter", which re-uses the previous turn's sources. The answer came back
+correct and **completely uncited**. My system prompt has an explicit rule requiring inline citations
+on every claim. I added a *second* rule specifically saying reformat requests still need them. It
+was ignored again.
+
+The cause: on a re-use turn the model is shown its own previous answer with every citation stripped
+out, and then asked to reproduce it more briefly. It copied what it saw. **The example in the
+context window beat the instruction in the system prompt.**
+
+The fix was one flag — keep the markers on the final assistant message, but only on a re-use turn,
+where the sources genuinely are the same ones. Verified: the citation now survives.
+
+The transferable lesson is the one I'd actually lead with: **when a model ignores a rule, look at
+what the prompt is *showing* it before you write another rule.** Prompt engineering failures are
+frequently demonstration failures, not instruction failures.
+
 </details>
 
 ### 3.2 Backend and API design
@@ -252,6 +412,18 @@ of a page. A 300-page PDF of short pages gives ~300 tiny chunks instead of ~45 g
 chunks embed into vague vectors. I shipped it anyway and wrote the limitation into the code, because
 whether it bites depends entirely on the corpus, and the eval harness can answer that where I'd only
 be guessing.
+
+**And I've now reproduced it deliberately.** The eval corpus renders each source at two page
+densities — same text, different amount per page. Dense: 19 pages, 56 chunks, median 956 characters.
+Sparse: 122 pages, **122 chunks**, median 336. The proof isn't the chunk count, it's that in the
+sparse case the chars-per-page and chars-per-chunk distributions come out *identical* — same
+minimum, median, p90 and maximum. That can only happen if every page yielded exactly one chunk,
+i.e. the page boundary decided every split before `chunkSize` was ever consulted.
+
+If they push, know where that stops: it demonstrates the **mechanism**, not the **cost**. "Vague
+vectors retrieve worse" is still a story, not a measurement. Running the same golden set against
+both renderings makes page density the only variable, and *that* delta is what justifies a schema
+change. Being able to draw that line is the actual answer to this question.
 </details>
 
 <details>
@@ -290,7 +462,7 @@ better error message. It isn't stopping a live exploit, and I wouldn't claim it 
 </details>
 
 <details>
-<summary><b>⭐ Your JSON body limit is 1 MB. How does a 10 MB upload get through?</b></summary>
+<summary><b>⭐ Your JSON body limit is 1 MB. How does a 4 MB upload get through?</b></summary>
 
 It never touches that limit. **Body parsers are content-type-gated.** `express.json()` checks
 `Content-Type` first, sees `multipart/form-data`, and calls `next()` having read zero bytes — its
@@ -335,11 +507,19 @@ contain the filename they just picked. The message names the existing document i
 Partly deliberate learning — I wanted to build a real backend, not one hidden behind a framework.
 
 But there's a technical case too: the API and the frontend have completely different scaling and
-deployment profiles. The API needs a long-lived process for streaming and will need a background
-worker for ingestion. Next.js route handlers on a serverless platform are a poor fit for both. Split,
-the web app deploys to Vercel and the API to Cloud Run, and each scales on its own terms.
+deployment profiles. The API needs a real middleware stack — auth, rate limiting, concurrency
+control, one error boundary — and will need a background worker for ingestion. Split, each deploys
+and scales on its own terms.
 
 The cost is CORS configuration and two deployments. Worth it.
+
+**Volunteer the tension before they find it.** The API *is* deployed to Vercel Functions today, so
+"not serverless" isn't the distinction — it's a separate service, separate domain, separate deploy,
+with middleware that runs in a defined order, which Next.js route handlers don't give you. And the
+deployment model made the design *harder* in an instructive way: single-instance assumptions stopped
+holding, which is what pushed the rate limiters onto Redis. "I moved to Redis because the deployment
+model made in-memory limits dishonest" is a better story than "my limits work because I pinned
+max-instances to 1."
 </details>
 
 <details>
@@ -661,14 +841,27 @@ simultaneously too coarse and too easy to escape. **The account is what costs mo
 gets the budget.**
 
 **And the setting that makes it real or fake:** `trust proxy` must be an exact hop count. In
-production the socket belongs to Cloud Run's front end, so `req.ip` is the proxy unless Express is
-told otherwise. Unset, everyone on Earth shares one bucket. Set to `true`, an attacker forges
+production the socket belongs to the platform's edge (Vercel's), not the user, so `req.ip` is the
+proxy unless Express is told otherwise. Unset, everyone on Earth shares one bucket. Set to `true`, an attacker forges
 `X-Forwarded-For` and mints a fresh unlimited bucket per request — the limiter is still there, still
 reporting, and enforcing nothing.
 
-**And the honest limitation:** the stores are in-memory and per-process, so behind an autoscaler the
-effective limit is `limit × instances`. It's a one-line swap to `rate-limit-redis` *because*
-everything goes through one factory function.
+**And where the counters live, which the deployment forced:** the rate limiters are backed by Redis.
+In memory they're exact on one instance and meaningless on many — the effective limit becomes
+`limit × instances` and the global cap becomes per-instance, while every `RateLimit` header keeps
+reporting correctly. On a platform that autoscales, that's a limiter that enforces nothing, so
+`REDIS_URL` is required at boot in production rather than falling back.
+
+**The detail worth volunteering, because it's the part that isn't obvious:** `rate-limit-redis`
+prefixes every store with `rl:` by default, and the 1-minute and 1-day query limiters both key on
+`user.id` — so out of the box both `INCR` the *same* key with different expiries and the burst window
+silently resets the daily budget. Nothing errors; the limits just look flaky. The fix is a required
+`name` per limiter, required rather than defaulted so the type checker makes it impossible to forget.
+
+**The concurrency cap deliberately stayed in memory.** It counts open sockets, which this process
+owns; a shared Redis counter would need a lease with a timeout to survive an instance dying
+mid-stream. It's not broken, it's scoped — and the per-user *cost* bound it used to double as is now
+the Redis limiters' job.
 </details>
 
 <details>
@@ -677,8 +870,10 @@ everything goes through one factory function.
 Not the vector search — HNSW is roughly logarithmic. Three things go first:
 
 1. **Ingestion latency.** It's synchronous today, inside the HTTP request. Long documents already
-   have no headroom under Cloud Run's 300s ceiling. This is the first thing I'd fix, and it's
-   designed: `pg-boss` on the same Postgres, `ingestDocument` unchanged as the job handler.
+   have no headroom under the platform's function timeout. This is the first thing I'd fix, and
+   it's designed: `pg-boss` on the same Postgres, `ingestDocument` unchanged as the job handler.
+   Note the deployment made this *harder*, not easier — an in-process worker is a container move;
+   on functions it needs a queue or cron service. That's a door the deploy closed knowingly.
 2. **Filtered-search recall.** Post-filtering degrades as tenants multiply; iterative scan buys time,
    and the next move is per-tenant partial indexes — genuinely faster, but it multiplies index count
    by tenant count and needs a backfill.
@@ -695,10 +890,11 @@ up.
 
 *Don't be defensive. This is a scoping decision, and scoping decisions are senior work.*
 
-Deliberate sequencing. The queue adds a second always-on service — Cloud Run throttles CPU to near
-zero outside a request unless CPU-always-allocated is set, so a queue consumer inside the API
-container would stall whenever traffic went quiet, intermittently, only in production. That means a
-worker with `min-instances = 1` that doesn't scale to zero and costs money at idle.
+Deliberate sequencing. The queue adds a second always-on service, and no serverless platform will
+host it as a side effect of the API: work started outside a request either gets its CPU throttled or
+is killed when the invocation returns. On the current Vercel deployment that means a queue consumer
+cannot simply live inside the API process at all — it needs a separate worker, or a cron/queue
+service. That's a real second component with its own cost and failure modes, not a library import.
 
 I chose to finish the read path end to end first, because that's where the product value and the
 harder engineering are. The write path's seam is already in place — `ingestDocument` takes a plain
@@ -765,15 +961,18 @@ judgement.
 
 | Gap | The honest framing |
 |---|---|
-| **No automated tests** | The biggest one. `createApp()` is factored for supertest and services take injectable `embedFn` stubs, so the seams exist — I haven't written the tests. First targets: the tenant-scope predicate in retrieval, the P2002 dedupe race, and the stream line-buffering. |
-| **No eval harness** | Which means `k=5`, chunk 1000/200 and `ef_search=100` are judgement calls, not measurements. Designed; it's the next milestone. |
+| **Tests cover the boundary, not the database path** | 53 unit + HTTP tests run with no database and no network: validation schemas, chunking, and everything that resolves before the first query — auth rejections, body-parser failures, routing. What's *not* covered is anything needing a real row, which includes the three highest-value targets: the tenant-scope predicate in retrieval, the P2002 dedupe race, and the stream line-buffering. Those need an integration tier against a real Postgres with a stub embedder. The seams are all in place (`embedFn`, `createApp()`); the tier isn't written. |
+| **The conversations module has no tests at all** | It's the newest code in the repo and it was verified by hand against a real database and a real model — which is not the same thing, and I'd say so before being asked. Three pure functions belong in the unit tier today: the rewriter's fallback guards, the orphan-dropping in history construction, and title derivation. The persistence path, the `seq` race and "an abort still writes the partial answer" all need the integration tier above. |
+| **Rewrite quality is unmeasured** | The rewrite step sits upstream of retrieval, so it has its own failure mode: a rewrite that loses the user's intent produces *confident retrieval of the wrong passage*, which reads exactly like a retrieval regression. The measurement that would justify the step is hit-rate@k on the rewritten query versus the raw follow-up over a multi-turn set. It doesn't exist yet, which is why the single-turn endpoint was deliberately left untouched — the existing golden set still scores something clean. |
+| **The rewritten query isn't persisted** | It's streamed to the UI so you can see what was actually searched for, but it's a property of the turn rather than the stored message, so it's gone on reload. One nullable column would fix it; deferred as a second migration for what is essentially a debugging affordance. |
+| **No eval harness *yet*** | Which means `k=5`, chunk 1000/200 and `ef_search=100` are still judgement calls, not measurements. In progress: the corpus builder and the test runner are done, the golden set and the metrics are not. Nothing about answer quality has been measured, so nothing about it is claimed. |
 | **Synchronous ingestion** | Should be queued. The seam is in place; the concrete dead-end it causes (transient 429 → `FAILED` → dedupe blocks retry) is known. |
 | **No refresh tokens / revocation** | Logout is client-side only. Token stays valid up to an hour. |
 | **Login timing side-channel** | Messages match, timings don't. Fix is a dummy-hash verify. |
 | **Token in `localStorage`** | XSS-stealable. `httpOnly` cookie is the hardening step, and it needs CSRF protection with it. |
-| **In-memory rate-limit store** | Per-process, so it multiplies by instance count behind an autoscaler. One-line swap to Redis. |
+| **Concurrency cap is per-instance** | The rate limiters moved to Redis; the concurrency `Map` deliberately didn't, because it counts sockets this process owns. So "2 streams per user" is really "2 per instance" behind an autoscaler. The per-user cost bound it used to double as is now the Redis limiters' job — what's left is event-loop protection, which is exactly what a per-process count should protect. |
 | **No hybrid search** | Embeddings underperform on exact identifiers — error codes, SKUs, names. BM25 + vector with fusion is the standard answer. I've seen this concretely: a test corpus of near-identical paragraphs distinguished only by a marker token retrieved at a flat ~0.52 similarity across all of them and correctly refused, because there was no *semantic* difference to find. |
-| **Per-page chunking makes the page a hard chunk boundary** | Overlap can't bridge a page break, and a PDF of short pages produces many small, weakly-retrievable chunks. The fix is a merge pass, which needs a page *range* on the chunk table — a schema change. Deliberately gated on the eval harness: whether it matters depends on the corpus, and that's measurable. |
+| **Per-page chunking makes the page a hard chunk boundary** | Overlap can't bridge a page break, and a PDF of short pages produces many small, weakly-retrievable chunks — measured: the same document at two page densities gives 64 chunks (median 953 chars) versus 137 chunks (median 335), where the chars-per-page and chars-per-chunk distributions come out identical — the page boundary decided every split and `chunkSize` was never consulted. The fix is a merge pass, which needs a page *range* on the chunk table — a schema change. Still gated on the eval harness, because what's measured is the *mechanism*, not the retrieval cost. |
 | **Uploaded files aren't stored** | Only the extracted text is kept. It means re-processing can't recover text a better parser would have found — the user would have to upload again. Fine while extraction is a solved problem for text-bearing PDFs; not fine if OCR were in scope. |
 | **No OCR** | Scanned PDFs are detected (every page extracts empty) and rejected with a specific 422 rather than silently ingested as an empty document. Supporting them is a different capability, not a bigger version of this one. |
 | **No re-ranking** | Top-k by cosine distance only. A cross-encoder re-ranker over ~20 candidates is the usual next quality win. |
@@ -789,10 +988,26 @@ one where I can't."*
 
 ### Ground rules
 
-- ❌ Don't write "tested" or "test coverage." There is no test suite.
-- ❌ Don't write "deployed to production" or "serving N users" until it's true.
+- 🟡 **"Tested" is now partly true — say the true part and stop.** There are 42 unit and HTTP tests
+  running with no database and no network. ✅ You can say "unit and HTTP-level test suite". ❌ You
+  cannot say "test coverage", quote a coverage percentage, or imply the data layer is covered — the
+  tenant-scope predicate, the dedupe race and the stream buffering are exactly what isn't tested
+  yet, and they're the first thing a sharp interviewer will ask about. Volunteering that boundary is
+  stronger than being caught at it.
+- ✅ "Deployed to production" is now true and verifiable — `rag.abhisheksatyam.com`, live, with
+  streaming and refusal behaviour confirmed against the deployed API. ❌ "Serving N users" is still
+  not; don't write it.
 - ❌ Don't quote latency or accuracy numbers. You haven't measured them. **One "what was your p95?"
-  and a fabricated number ends the interview.**
+  and a fabricated number ends the interview.** The eval harness is in progress and has produced
+  exactly one measurement so far — a *chunking* statistic, not a quality one. See the next rule.
+- 🟡 **The one measured number you may quote**, because it came from running the code: rendering the
+  same document at two page densities gives 19 pages → 56 chunks (median 956 chars) versus 122 pages
+  → 122 chunks (median 336 chars). Frame it as what it is — evidence that page boundaries override
+  `chunkSize`, **not** evidence that retrieval got worse. That second claim needs hit-rate, which
+  doesn't exist yet. Quoting it correctly is a demonstration of exactly the discipline this whole
+  section is about.
+  **Re-run `pnpm eval:inspect` before an interview.** These figures drift whenever the docs are
+  edited, because the docs *are* the corpus — which is itself a decent thing to be able to explain.
 - ✅ Do quantify what's actually verifiable: dimensions, limits, chunk sizes, rate limits, model names.
 
 ### Résumé bullets
@@ -819,14 +1034,18 @@ Pick 3–4. Each is defensible from the code.
 >   rather than an internal chunk ordinal; file type is validated by magic bytes rather than the
 >   client-supplied content type, and dedupe hashes extracted text so re-exports of the same
 >   document don't re-embed.
+> - Added multi-turn conversations with a history-aware query-rewriting step, so pronoun follow-ups
+>   retrieve correctly, plus a sentinel path that skips retrieval entirely for reformat instructions;
+>   citations are snapshotted per message so answers stay verifiable after the underlying chunks are
+>   re-ingested.
 > - Authored HLD and LLD design docs covering topology, failure modes, capacity, and a scaling
 >   ladder.
 
 **One-line version** for a skills-dense résumé:
 
 > Full-stack RAG document Q&A app (TypeScript, Express, Next.js, Postgres/pgvector, OpenAI) —
-> streaming grounded answers with clickable citations, multi-tenant vector search, and layered
-> rate-limiting and cost controls.
+> streaming grounded answers with clickable citations, multi-turn conversations with query
+> rewriting, multi-tenant vector search, and layered rate-limiting and cost controls.
 
 ### Skills this legitimately adds
 
@@ -883,19 +1102,37 @@ Cover the answers. If you hesitate, reread the linked section.
 12. Why does `POST /documents` re-read the row before responding?
 13. Trace the abort chain from tab-close to OpenAI.
 14. Why does the documents page poll the list rather than each document?
-15. Why doesn't `express.json({ limit: "1mb" })` bound a 10 MB upload? → [§1.14](concepts.md#114-file-uploads--multipart-and-the-limit-that-doesnt-apply)
+15. Why doesn't `express.json({ limit: "1mb" })` bound a 4 MB upload? → [§1.14](concepts.md#114-file-uploads--multipart-and-the-limit-that-doesnt-apply)
 16. Why is `file.mimetype` worthless as a security control, and what replaces it?
 17. Why must you *not* set `Content-Type` when sending a `FormData` body?
 18. Dedupe hashes extracted text, not file bytes. Give the argument for that, then the cost.
 19. What does per-page chunking do to a 300-page PDF of one-paragraph pages? → [§2.3](concepts.md#23-chunking--why-documents-get-cut-up)
 
+**Conversations**
+20. Why does "How long is it?" retrieve nothing, and which component is at fault? → [§2.7](concepts.md#27-conversational-rag--why-a-follow-up-breaks-everything)
+21. The rewrite drives one thing and the original question drives another. Which is which, and what
+    breaks if you swap them?
+22. Why does "make that shorter" skip retrieval entirely instead of just searching for it?
+23. Turn 1 and turn 3 both have a source `[2]`. Name the two separate places that collision has to
+    be handled — one in the prompt, one in the UI.
+24. Why is history loaded from the database rather than posted by the client? → [Flow 9](flows.md#flow-9--ask-a-follow-up-the-conversation-path)
+25. Why is the assistant message written in a `finally`, and why is that write `.catch`-wrapped?
+26. Two tabs append to the same thread at the same moment. What stops the transcript interleaving,
+    and what status code does the loser get?
+27. Why do the rate limiters sit on the chat POSTs rather than at the router's mount point?
+28. Why wasn't the rewrite step just added to the existing `/queries` endpoint?
+
 **Judgement**
-20. What's the first thing you'd fix, and why that one?
-21. What can't you currently measure?
-22. What would break first at 100× scale?
-23. Which decision in this project are you least sure about? *(Good honest answer: chunk size — and
+29. What's the first thing you'd fix, and why that one?
+30. What can't you currently measure?
+31. What would break first at 100× scale?
+32. Which decision in this project are you least sure about? *(Good honest answer: chunk size — and
     now per-page vs. whole-document chunking, which is the same kind of question. The eval harness
-    exists to settle both.)*
+    exists to settle both. A close second: shipping two question-answering surfaces, `/ask` and
+    `/chat`, and whether that's a defensible split or one I should collapse.)*
+33. You added a feature you'd previously listed as "deferred until evals prove it helps." Defend
+    that. *(Honest answer: multi-turn is unusable without it, so the sequencing changed — but it
+    shipped on a product argument, not a measured one, and nothing in the repo claims otherwise.)*
 
 ---
 
